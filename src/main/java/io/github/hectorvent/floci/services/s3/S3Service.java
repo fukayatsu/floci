@@ -20,6 +20,7 @@ import org.jboss.logging.Logger;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.MessageDigest;
@@ -425,12 +426,24 @@ public class S3Service {
 
         if (delimiter != null && !delimiter.isEmpty()) {
             // Filter to only return objects at this level (simulate directory listing)
-            allObjects = allObjects.stream()
+            allObjects = new ArrayList<>(allObjects.stream()
                     .filter(obj -> {
                         String remainder = obj.getKey().substring(prefix != null ? prefix.length() : 0);
                         return !remainder.contains(delimiter);
                     })
-                    .toList();
+                    .toList());
+        }
+
+        // General purpose buckets return keys in lexicographic (UTF-8) order
+        // Directory buckets (names ending with DIRECTORY_BUCKET_SUFFIX) do not guarantee order
+        if (!isDirectoryBucket(bucketName)) {
+            Map<String, byte[]> keyBytes = new HashMap<>(allObjects.size());
+            for (S3Object obj : allObjects) {
+                keyBytes.computeIfAbsent(obj.getKey(), k -> k.getBytes(StandardCharsets.UTF_8));
+            }
+            allObjects.sort(Comparator.comparing(
+                    obj -> keyBytes.get(obj.getKey()),
+                    Arrays::compareUnsigned));
         }
 
         if (maxKeys > 0 && allObjects.size() > maxKeys) {
@@ -438,6 +451,12 @@ public class S3Service {
         }
 
         return allObjects;
+    }
+
+    static final String DIRECTORY_BUCKET_SUFFIX = "--x-s3";
+
+    static boolean isDirectoryBucket(String bucketName) {
+        return bucketName != null && bucketName.endsWith(DIRECTORY_BUCKET_SUFFIX);
     }
 
     public S3Object copyObject(String sourceBucket, String sourceKey,

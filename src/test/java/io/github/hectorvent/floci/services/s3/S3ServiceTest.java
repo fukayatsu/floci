@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.s3;
 
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.storage.InMemoryStorage;
+import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.services.s3.model.GetObjectAttributesResult;
 import io.github.hectorvent.floci.services.s3.model.ObjectAttributeName;
 import io.github.hectorvent.floci.services.s3.model.Bucket;
@@ -13,9 +14,8 @@ import org.junit.jupiter.api.io.TempDir;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
+import java.util.*;
+import java.util.function.Predicate;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -277,5 +277,114 @@ class S3ServiceTest {
         assertEquals("application/json", copy.getContentType());
         assertEquals("STANDARD_IA", copy.getStorageClass());
         assertEquals("dest", copy.getMetadata().get("owner"));
+    }
+
+    @Test
+    void listObjectsReturnsKeysInLexicographicOrder() {
+        s3Service.createBucket("test-bucket", "us-east-1");
+        // Insert in non-sorted order
+        s3Service.putObject("test-bucket", "c.txt", "c".getBytes(), null, null);
+        s3Service.putObject("test-bucket", "a.txt", "a".getBytes(), null, null);
+        s3Service.putObject("test-bucket", "b.txt", "b".getBytes(), null, null);
+
+        List<S3Object> objects = s3Service.listObjects("test-bucket", null, null, 1000);
+        assertEquals(3, objects.size());
+        assertEquals("a.txt", objects.get(0).getKey());
+        assertEquals("b.txt", objects.get(1).getKey());
+        assertEquals("c.txt", objects.get(2).getKey());
+    }
+
+    @Test
+    void listObjectsWithPrefixReturnsKeysInLexicographicOrder() {
+        s3Service.createBucket("test-bucket", "us-east-1");
+        s3Service.putObject("test-bucket", "dir/z.txt", "z".getBytes(), null, null);
+        s3Service.putObject("test-bucket", "dir/a.txt", "a".getBytes(), null, null);
+        s3Service.putObject("test-bucket", "dir/m.txt", "m".getBytes(), null, null);
+        s3Service.putObject("test-bucket", "other/x.txt", "x".getBytes(), null, null);
+
+        List<S3Object> objects = s3Service.listObjects("test-bucket", "dir/", null, 1000);
+        assertEquals(3, objects.size());
+        assertEquals("dir/a.txt", objects.get(0).getKey());
+        assertEquals("dir/m.txt", objects.get(1).getKey());
+        assertEquals("dir/z.txt", objects.get(2).getKey());
+    }
+
+    @Test
+    void listObjectsMaxKeysRespectsLexicographicOrder() {
+        s3Service.createBucket("test-bucket", "us-east-1");
+        s3Service.putObject("test-bucket", "c.txt", "c".getBytes(), null, null);
+        s3Service.putObject("test-bucket", "a.txt", "a".getBytes(), null, null);
+        s3Service.putObject("test-bucket", "b.txt", "b".getBytes(), null, null);
+
+        List<S3Object> objects = s3Service.listObjects("test-bucket", null, null, 2);
+        assertEquals(2, objects.size());
+        assertEquals("a.txt", objects.get(0).getKey());
+        assertEquals("b.txt", objects.get(1).getKey());
+    }
+
+    @Test
+    void listObjectsReturnsNonAsciiKeysInUtf8LexicographicOrder() {
+        s3Service.createBucket("non-ascii-bucket", "us-east-1");
+        // U+E000 in UTF-8: EE 80 80 (BMP, Private Use Area)
+        // U+10000 in UTF-8: F0 90 80 80 (supplementary plane)
+        // Java String.compareTo (UTF-16): U+E000 (0xE000) > U+10000 (surrogate 0xD800)
+        // UTF-8 unsigned byte order: U+E000 (0xEE) < U+10000 (0xF0)
+        String keyE000 = "\uE000.txt";
+        String key10000 = new String(Character.toChars(0x10000)) + ".txt";
+
+        s3Service.putObject("non-ascii-bucket", key10000, "b".getBytes(StandardCharsets.UTF_8), null, null);
+        s3Service.putObject("non-ascii-bucket", keyE000, "a".getBytes(StandardCharsets.UTF_8), null, null);
+
+        List<S3Object> objects = s3Service.listObjects("non-ascii-bucket", null, null, 1000);
+        assertEquals(2, objects.size());
+        // UTF-8 byte order: U+E000 (EE 80 80) < U+10000 (F0 90 80 80)
+        assertEquals(keyE000, objects.get(0).getKey());
+        assertEquals(key10000, objects.get(1).getKey());
+    }
+
+    @Test
+    void listObjectsDirectoryBucketDoesNotSort() {
+        // Use a LinkedHashMap-backed storage that preserves insertion order
+        OrderedStorage<String, S3Object> objectStore = new OrderedStorage<>();
+        S3Service orderedService = new S3Service(new InMemoryStorage<>(), objectStore, tempDir.resolve("s3-ordered"));
+        orderedService.createBucket("my-bucket--x-s3", "us-east-1");
+        // Insert in reverse lexicographic order
+        orderedService.putObject("my-bucket--x-s3", "c.txt", "c".getBytes(), null, null);
+        orderedService.putObject("my-bucket--x-s3", "b.txt", "b".getBytes(), null, null);
+        orderedService.putObject("my-bucket--x-s3", "a.txt", "a".getBytes(), null, null);
+
+        List<S3Object> objects = orderedService.listObjects("my-bucket--x-s3", null, null, 1000);
+        assertEquals(3, objects.size());
+        // Directory bucket: sorting is skipped, so insertion order (c, b, a) is preserved
+        assertEquals("c.txt", objects.get(0).getKey());
+        assertEquals("b.txt", objects.get(1).getKey());
+        assertEquals("a.txt", objects.get(2).getKey());
+    }
+
+    @Test
+    void isDirectoryBucket() {
+        assertTrue(S3Service.isDirectoryBucket("my-bucket--x-s3"));
+        assertFalse(S3Service.isDirectoryBucket("my-bucket"));
+        assertFalse(S3Service.isDirectoryBucket(null));
+    }
+
+    /**
+     * A storage backend backed by LinkedHashMap to preserve insertion order in scan().
+     */
+    static class OrderedStorage<K, V> implements StorageBackend<K, V> {
+        private final LinkedHashMap<K, V> store = new LinkedHashMap<>();
+
+        @Override public void put(K key, V value) { store.put(key, value); }
+        @Override public Optional<V> get(K key) { return Optional.ofNullable(store.get(key)); }
+        @Override public void delete(K key) { store.remove(key); }
+        @Override public List<V> scan(Predicate<K> keyFilter) {
+            List<V> result = new ArrayList<>();
+            store.forEach((k, v) -> { if (keyFilter.test(k)) result.add(v); });
+            return result;
+        }
+        @Override public Set<K> keys() { return Collections.unmodifiableSet(store.keySet()); }
+        @Override public void flush() { }
+        @Override public void load() { }
+        @Override public void clear() { store.clear(); }
     }
 }
